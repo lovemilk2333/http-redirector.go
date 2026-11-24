@@ -54,7 +54,7 @@ func TestProxyHandlerForwardsHTTPRequest(t *testing.T) {
 
 func TestHandlerBridgesHTTPToHTTPSWithoutRedirectResponse(t *testing.T) {
 	redirectList := []string{"+.example.com"}
-	var bypassList []string
+	bypassList := []string{"+.test"}
 	config := &Config{RedirectList: &redirectList, BypassList: &bypassList}
 	if err := config.ParseRules(); err != nil {
 		t.Fatal(err)
@@ -96,9 +96,61 @@ func TestHandlerBridgesHTTPToHTTPSWithoutRedirectResponse(t *testing.T) {
 	}
 }
 
+func TestHandlerAppliesRedirectDenyBypassPriority(t *testing.T) {
+	redirectList := []string{"+.redirect.example"}
+	denyList := []string{"+.redirect.example", "+.blocked.example"}
+	bypassList := []string{"+.redirect.example", "+.blocked.example", "+.bypass.example"}
+	config := &Config{RedirectList: &redirectList, DenyList: &denyList, BypassList: &bypassList}
+	if err := config.ParseRules(); err != nil {
+		t.Fatal(err)
+	}
+	loader := &ConfigLoader{}
+	loader.config.Store(config)
+
+	tests := []struct {
+		name       string
+		url        string
+		wantStatus int
+		wantScheme string
+	}{
+		{name: "redirect precedes deny and bypass", url: "http://www.redirect.example/", wantStatus: http.StatusOK, wantScheme: "https"},
+		{name: "deny precedes bypass", url: "http://www.blocked.example/", wantStatus: http.StatusForbidden},
+		{name: "bypass forwards directly", url: "http://www.bypass.example/", wantStatus: http.StatusOK, wantScheme: "http"},
+		{name: "unmatched host is denied by default", url: "http://unlisted.test/", wantStatus: http.StatusForbidden},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, test.url, nil)
+			response := httptest.NewRecorder()
+			transportCalled := false
+			transport := roundTripFunc(func(upstream *http.Request) (*http.Response, error) {
+				transportCalled = true
+				if upstream.URL.Scheme != test.wantScheme {
+					t.Errorf("upstream scheme = %q, want %q", upstream.URL.Scheme, test.wantScheme)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    upstream,
+				}, nil
+			})
+
+			newHandler(loader, true, transport).ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Errorf("response status = %d, want %d", response.Code, test.wantStatus)
+			}
+			if got := transportCalled; got != (test.wantStatus == http.StatusOK) {
+				t.Errorf("transport called = %t, want %t", got, test.wantStatus == http.StatusOK)
+			}
+		})
+	}
+}
+
 func TestConnectUpstreamAddressUpgradesPort80ForRedirectedHost(t *testing.T) {
 	redirectList := []string{"+.example.com"}
-	bypassList := []string{"safe.example.com"}
+	bypassList := []string{"safe.example.com", "safe.other.test"}
 	config := &Config{RedirectList: &redirectList, BypassList: &bypassList}
 	if err := config.ParseRules(); err != nil {
 		t.Fatal(err)
@@ -110,7 +162,8 @@ func TestConnectUpstreamAddressUpgradesPort80ForRedirectedHost(t *testing.T) {
 		want string
 	}{
 		{name: "redirected host", host: "qh.example.com:80", want: "qh.example.com:443"},
-		{name: "bypassed host", host: "safe.example.com:80", want: "safe.example.com:80"},
+		{name: "redirect takes precedence over bypass", host: "safe.example.com:80", want: "safe.example.com:443"},
+		{name: "bypass without redirect", host: "safe.other.test:80", want: "safe.other.test:80"},
 		{name: "other port", host: "qh.example.com:8080", want: "qh.example.com:8080"},
 		{name: "default TLS port", host: "qh.example.com", want: "qh.example.com:443"},
 	}
@@ -123,13 +176,27 @@ func TestConnectUpstreamAddressUpgradesPort80ForRedirectedHost(t *testing.T) {
 		})
 	}
 
-	if _, _, tlsBridge := connectUpstreamTarget("qh.example.com:80", config); !tlsBridge {
+	if _, _, tlsBridge, denied := connectUpstreamTarget("qh.example.com:80", config); !tlsBridge || denied {
 		t.Error("matching CONNECT request on port 80 should use a TLS bridge")
 	}
-	if _, _, tlsBridge := connectUpstreamTarget("safe.example.com:80", config); tlsBridge {
-		t.Error("bypassed CONNECT request should remain a raw tunnel")
+	if _, _, tlsBridge, denied := connectUpstreamTarget("safe.example.com:80", config); !tlsBridge || denied {
+		t.Error("redirect should take precedence over bypass for CONNECT requests")
 	}
-	if _, _, tlsBridge := connectUpstreamTarget("qh.example.com:443", config); tlsBridge {
+	if _, _, tlsBridge, denied := connectUpstreamTarget("safe.other.test:80", config); tlsBridge || denied {
+		t.Error("bypassed CONNECT request without a redirect match should remain a raw tunnel")
+	}
+	if _, _, tlsBridge, _ := connectUpstreamTarget("qh.example.com:443", config); tlsBridge {
 		t.Error("CONNECT request to port 443 should remain a raw tunnel")
+	}
+}
+
+func TestParseRequestHostRejectsInvalidDomains(t *testing.T) {
+	for _, host := range []string{"bad_name.example", "-bad.example", "bad-.example", strings.Repeat("a", MaxDomainLabelLength+1) + ".com"} {
+		t.Run(host, func(t *testing.T) {
+			request := &http.Request{Host: host}
+			if _, err := parseRequestHost(request); err == nil {
+				t.Errorf("parseRequestHost(%q) succeeded, want invalid-domain error", host)
+			}
+		})
 	}
 }

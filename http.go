@@ -36,6 +36,17 @@ func newHandler(cl *ConfigLoader, isHTTP bool, transport http.RoundTripper) http
 		config := cl.Config()
 		host = strings.ToLower(strings.TrimSuffix(host, "."))
 		upgradeToHTTPS := shouldUpgradeToHTTPS(config, host)
+		denied := !upgradeToHTTPS && matchesDenyHost(config, host)
+		bypassed := matchesBypassHost(config, host)
+		if !upgradeToHTTPS && (denied || !bypassed) {
+			reason := "host did not match redirect or bypass rules"
+			if denied {
+				reason = "host matched deny rules"
+			}
+			slog.Debug("request denied", slog.String("reason", reason), slog.String("host", host), slog.String("from", r.RemoteAddr))
+			http.Error(w, "request denied", http.StatusForbidden)
+			return
+		}
 		if err := forwardHTTPWithTransport(w, r, upgradeToHTTPS, transport); err != nil {
 			slog.Debug("request forwarding failed", slog.String("host", host), slog.String("from", r.RemoteAddr), slog.Any("error", err))
 			http.Error(w, "upstream request failed", http.StatusBadGateway)
@@ -46,9 +57,25 @@ func newHandler(cl *ConfigLoader, isHTTP bool, transport http.RoundTripper) http
 func shouldUpgradeToHTTPS(config *Config, host string) bool {
 	addr, err := netip.ParseAddr(host)
 	if err == nil {
-		return config.MatchRedirectAddr(addr) && !config.MatchBypassAddr(addr)
+		return config.MatchRedirectAddr(addr)
 	}
-	return config.MatchRedirectDomain(host) && !config.MatchBypassDomain(host)
+	return config.MatchRedirectDomain(host)
+}
+
+func matchesDenyHost(config *Config, host string) bool {
+	addr, err := netip.ParseAddr(host)
+	if err == nil {
+		return config.MatchDenyAddr(addr)
+	}
+	return config.MatchDenyDomain(host)
+}
+
+func matchesBypassHost(config *Config, host string) bool {
+	addr, err := netip.ParseAddr(host)
+	if err == nil {
+		return config.MatchBypassAddr(addr)
+	}
+	return config.MatchBypassDomain(host)
 }
 
 func forwardHTTPWithTransport(w http.ResponseWriter, r *http.Request, upgradeToHTTPS bool, transport http.RoundTripper) error {
@@ -128,7 +155,7 @@ func copyResponseHeaders(destination, source http.Header) {
 	}
 }
 
-func connectUpstreamTarget(host string, config *Config) (address, serverName string, tlsBridge bool) {
+func connectUpstreamTarget(host string, config *Config) (address, serverName string, tlsBridge, denied bool) {
 	requestHost, port, err := net.SplitHostPort(host)
 	if err != nil {
 		requestHost = strings.Trim(host, "[]")
@@ -138,20 +165,27 @@ func connectUpstreamTarget(host string, config *Config) (address, serverName str
 		port = "443"
 	}
 	requestHost = strings.ToLower(strings.TrimSuffix(requestHost, "."))
-	tlsBridge = port == "80" && shouldUpgradeToHTTPS(config, requestHost)
+	redirect := shouldUpgradeToHTTPS(config, requestHost)
+	denied = !redirect && (matchesDenyHost(config, requestHost) || !matchesBypassHost(config, requestHost))
+	tlsBridge = port == "80" && redirect
 	if tlsBridge {
 		port = "443"
 	}
-	return net.JoinHostPort(requestHost, port), requestHost, tlsBridge
+	return net.JoinHostPort(requestHost, port), requestHost, tlsBridge, denied
 }
 
 func connectUpstreamAddress(host string, config *Config) string {
-	address, _, _ := connectUpstreamTarget(host, config)
+	address, _, _, _ := connectUpstreamTarget(host, config)
 	return address
 }
 
 func forwardConnect(w http.ResponseWriter, r *http.Request, config *Config) {
-	address, serverName, tlsBridge := connectUpstreamTarget(r.Host, config)
+	address, serverName, tlsBridge, denied := connectUpstreamTarget(r.Host, config)
+	if denied {
+		slog.Debug("CONNECT request denied", slog.String("reason", "host matched deny rules"), slog.String("host", r.Host), slog.String("from", r.RemoteAddr))
+		http.Error(w, "request denied", http.StatusForbidden)
+		return
+	}
 	upstream, err := (&net.Dialer{}).DialContext(r.Context(), "tcp", address)
 	if err != nil {
 		slog.Debug("CONNECT forwarding failed", slog.String("reason", "upstream dial failed"), slog.String("host", r.Host), slog.Any("error", err))
@@ -234,6 +268,11 @@ func parseRequestHost(r *http.Request) (string, error) {
 		if _, err := netip.ParseAddr(host); err != nil {
 			return "", err
 		}
+		return host, nil
+	}
+	domain := strings.TrimSuffix(strings.ToLower(host), ".")
+	if _, err := parseDomainLabels(domain, false); err != nil {
+		return "", fmt.Errorf("invalid request domain: %w", err)
 	}
 	return host, nil
 }
