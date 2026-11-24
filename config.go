@@ -26,6 +26,23 @@ var DEFAULT_BYPASS_LIST = []string{
 	"+.internal",
 }
 
+type RuleAction string
+
+const (
+	RuleRedirect RuleAction = "redirect"
+	RuleBypass   RuleAction = "bypass"
+	RuleDeny     RuleAction = "deny"
+)
+
+type CompiledRule struct {
+	Action  RuleAction
+	Negated bool
+	Domain  string
+	Prefix  netip.Prefix
+	IsCIDR  bool
+	Index   DomainRuleIndex
+}
+
 const DomainSep = "."
 
 const DOMAIN_RULE_SPECIAL_CHARS = "*+."
@@ -171,38 +188,25 @@ func parseDomainLabels(domain string, allowWildcard bool) ([]string, error) {
 }
 
 type Config struct {
-	LogLevel             string          `yaml:"log-level" default:"warn"` // `false` or `silent` to disable
-	LogSource            bool            `yaml:"log-source" default:"false"`
-	LogJSON              bool            `yaml:"log-json" default:"true"`
-	HTTPPort             uint16          `yaml:"http-port" default:"59080"`  // HTTP Port, `0` to disable
-	ProxyPort            uint16          `yaml:"proxy-port" default:"59123"` // HTTP Proxy Port, `0` to disable
-	RedirectList         *[]string       `yaml:"redirect-list"`
-	DenyList             *[]string       `yaml:"deny-list"`
-	BypassList           *[]string       `yaml:"bypass-list"`
-	RedirectRules        DomainRuleIndex `yaml:"-"`
-	RedirectExcludeRules DomainRuleIndex `yaml:"-"`
-	DenyRules            DomainRuleIndex `yaml:"-"`
-	DenyExcludeRules     DomainRuleIndex `yaml:"-"`
-	BypassRules          DomainRuleIndex `yaml:"-"`
-	BypassExcludeRules   DomainRuleIndex `yaml:"-"`
-	RedirectCIDRs        []netip.Prefix  `yaml:"-"`
-	RedirectExcludeCIDRs []netip.Prefix  `yaml:"-"`
-	DenyCIDRs            []netip.Prefix  `yaml:"-"`
-	DenyExcludeCIDRs     []netip.Prefix  `yaml:"-"`
-	BypassCIDRs          []netip.Prefix  `yaml:"-"`
-	BypassExcludeCIDRs   []netip.Prefix  `yaml:"-"`
+	LogLevel      string         `yaml:"log-level" default:"warn"` // `false` or `silent` to disable
+	LogSource     bool           `yaml:"log-source" default:"false"`
+	LogJSON       bool           `yaml:"log-json" default:"true"`
+	HTTPPort      uint16         `yaml:"http-port" default:"59080"`  // HTTP Port, `0` to disable
+	ProxyPort     uint16         `yaml:"proxy-port" default:"59123"` // HTTP Proxy Port, `0` to disable
+	Rules         *[]string      `yaml:"rules"`
+	CompiledRules []CompiledRule `yaml:"-"`
 }
 
 func (c *Config) MatchRedirectAddr(addr netip.Addr) bool {
-	return matchAddressRules(addr, c.RedirectCIDRs, c.RedirectExcludeCIDRs, c.RedirectList == nil || len(*c.RedirectList) == 0, true)
+	return c.ResolveAddr(addr) == RuleRedirect
 }
 
 func (c *Config) MatchBypassAddr(addr netip.Addr) bool {
-	return matchAddressRules(addr, c.BypassCIDRs, c.BypassExcludeCIDRs, c.BypassList == nil || len(*c.BypassList) == 0, false)
+	return c.ResolveAddr(addr) == RuleBypass
 }
 
 func (c *Config) MatchDenyAddr(addr netip.Addr) bool {
-	return matchAddressRules(addr, c.DenyCIDRs, c.DenyExcludeCIDRs, c.DenyList == nil || len(*c.DenyList) == 0, false)
+	return c.ResolveAddr(addr) == RuleDeny
 }
 
 func (c *Config) MatchRedirectDomain(domain string) bool {
@@ -210,48 +214,61 @@ func (c *Config) MatchRedirectDomain(domain string) bool {
 	if _, err := parseDomainLabels(domain, false); err != nil {
 		return false
 	}
-	return matchDomainRules(domain, c.RedirectRules, c.RedirectExcludeRules, c.RedirectList == nil || len(*c.RedirectList) == 0, true)
+	return c.ResolveDomain(domain) == RuleRedirect
 }
 
 func (c *Config) MatchBypassDomain(domain string) bool {
-	return matchDomainRules(strings.ToLower(domain), c.BypassRules, c.BypassExcludeRules, c.BypassList == nil || len(*c.BypassList) == 0, false)
+	return c.ResolveDomain(domain) == RuleBypass
 }
 
 func (c *Config) MatchDenyDomain(domain string) bool {
-	return matchDomainRules(strings.ToLower(domain), c.DenyRules, c.DenyExcludeRules, c.DenyList == nil || len(*c.DenyList) == 0, false)
+	return c.ResolveDomain(domain) == RuleDeny
 }
 
-func matchAddressRules(addr netip.Addr, includeCIDRs, excludeCIDRs []netip.Prefix, listEmpty, defaultIfEmpty bool) bool {
+func (c *Config) ResolveAddr(addr netip.Addr) RuleAction {
 	if !addr.IsValid() {
-		return false
+		return RuleDeny
 	}
-	if len(includeCIDRs) == 0 && len(excludeCIDRs) == 0 {
-		return listEmpty && defaultIfEmpty
+	for _, rule := range c.CompiledRules {
+		if !rule.IsCIDR {
+			continue
+		}
+		matched := rule.Prefix.Contains(addr)
+		if rule.Negated {
+			matched = !matched
+		}
+		if matched {
+			return rule.Action
+		}
 	}
-	if matchesCIDR(excludeCIDRs, addr) {
-		return false
-	}
-	if len(includeCIDRs) != 0 {
-		return matchesCIDR(includeCIDRs, addr)
-	}
-	return true
+	return RuleDeny
 }
 
-func matchDomainRules(domain string, includeDomains, excludeDomains DomainRuleIndex, listEmpty, defaultIfEmpty bool) bool {
+func (c *Config) ResolveHost(host string) RuleAction {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return c.ResolveAddr(addr)
+	}
+	return c.ResolveDomain(host)
+}
+
+func (c *Config) ResolveDomain(domain string) RuleAction {
 	domain = strings.TrimSuffix(strings.ToLower(domain), DomainSep)
 	if _, err := parseDomainLabels(domain, false); err != nil {
-		return false
+		return RuleDeny
 	}
-	if includeDomains.IsEmpty() && excludeDomains.IsEmpty() {
-		return listEmpty && defaultIfEmpty
+	for _, rule := range c.CompiledRules {
+		if rule.IsCIDR {
+			continue
+		}
+		matched := rule.Index.Matches(domain)
+		if rule.Negated {
+			matched = !matched
+		}
+		if matched {
+			return rule.Action
+		}
 	}
-	if excludeDomains.Matches(domain) {
-		return false
-	}
-	if !includeDomains.IsEmpty() {
-		return includeDomains.Matches(domain)
-	}
-	return true
+	return RuleDeny
 }
 
 func matchesCIDR(prefixes []netip.Prefix, addr netip.Addr) bool {
@@ -267,76 +284,45 @@ func matchesCIDR(prefixes []netip.Prefix, addr netip.Addr) bool {
 }
 
 func (c *Config) ParseRules() error {
-	if c.RedirectList == nil {
-		var emptyList []string = nil
-		c.RedirectList = &emptyList
+	if c.Rules == nil {
+		defaultRules := make([]string, 0, len(DEFAULT_BYPASS_LIST))
+		for _, rule := range DEFAULT_BYPASS_LIST {
+			defaultRules = append(defaultRules, rule+";bypass")
+		}
+		c.Rules = &defaultRules
 	}
-	if c.DenyList == nil {
-		var emptyList []string = nil
-		c.DenyList = &emptyList
-	}
-	if c.BypassList == nil {
-		defaultList := slices.Clone(DEFAULT_BYPASS_LIST)
-		c.BypassList = &defaultList
-	}
-
-	parse := func(raw []string) (DomainRuleIndex, []netip.Prefix, DomainRuleIndex, []netip.Prefix, error) {
-		includeRules := make(DomainRuleIndex)
-		excludeRules := make(DomainRuleIndex)
-		var includeCIDRs []netip.Prefix
-		var excludeCIDRs []netip.Prefix
-		for idx, value := range raw {
-			excluded := strings.HasPrefix(value, "!")
-			if excluded {
-				value = strings.TrimPrefix(value, "!")
-				if value == "" || strings.HasPrefix(value, "!") {
-					return nil, nil, nil, nil, fmt.Errorf("rule %d has malformed negation", idx)
-				}
-			}
-			if cidr, err := netip.ParsePrefix(value); err == nil {
-				if excluded {
-					excludeCIDRs = append(excludeCIDRs, cidr)
-				} else {
-					includeCIDRs = append(includeCIDRs, cidr)
-				}
-				continue
-			}
-			index := includeRules
-			if excluded {
-				index = excludeRules
-			}
-			if err := index.insert(value); err != nil {
-				return nil, nil, nil, nil, fmt.Errorf("rule %d (%q): %w", idx, value, err)
+	compiled := make([]CompiledRule, 0, len(*c.Rules))
+	for idx, raw := range *c.Rules {
+		parts := strings.Split(raw, ";")
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) != parts[1] {
+			return fmt.Errorf("rule %d (%q): expected `domain-or-cidr;action`", idx, raw)
+		}
+		value := parts[0]
+		action := RuleAction(parts[1])
+		if action != RuleRedirect && action != RuleBypass && action != RuleDeny {
+			return fmt.Errorf("rule %d (%q): unsupported action %q", idx, raw, action)
+		}
+		excluded := strings.HasPrefix(value, "!")
+		if excluded {
+			value = strings.TrimPrefix(value, "!")
+			if value == "" || strings.HasPrefix(value, "!") {
+				return fmt.Errorf("rule %d (%q): malformed negation", idx, raw)
 			}
 		}
-		return includeRules, includeCIDRs, excludeRules, excludeCIDRs, nil
+		compiledRule := CompiledRule{Action: action, Negated: excluded}
+		if cidr, err := netip.ParsePrefix(value); err == nil {
+			compiledRule.Prefix = cidr
+			compiledRule.IsCIDR = true
+		} else {
+			compiledRule.Domain = value
+			compiledRule.Index = make(DomainRuleIndex)
+			if err := compiledRule.Index.insert(value); err != nil {
+				return fmt.Errorf("rule %d (%q): %w", idx, raw, err)
+			}
+		}
+		compiled = append(compiled, compiledRule)
 	}
-
-	redirectRules, redirectCIDRs, redirectExcludeRules, redirectExcludeCIDRs, err := parse(*c.RedirectList)
-	if err != nil {
-		return fmt.Errorf("redirect list: %w", err)
-	}
-	denyRules, denyCIDRs, denyExcludeRules, denyExcludeCIDRs, err := parse(*c.DenyList)
-	if err != nil {
-		return fmt.Errorf("deny list: %w", err)
-	}
-	bypassRules, bypassCIDRs, bypassExcludeRules, bypassExcludeCIDRs, err := parse(*c.BypassList)
-	if err != nil {
-		return fmt.Errorf("bypass list: %w", err)
-	}
-	c.RedirectRules = redirectRules
-	c.RedirectExcludeRules = redirectExcludeRules
-	c.DenyRules = denyRules
-	c.DenyExcludeRules = denyExcludeRules
-	c.BypassRules = bypassRules
-	c.BypassExcludeRules = bypassExcludeRules
-	c.RedirectCIDRs = redirectCIDRs
-	c.RedirectExcludeCIDRs = redirectExcludeCIDRs
-	c.DenyCIDRs = denyCIDRs
-	c.DenyExcludeCIDRs = denyExcludeCIDRs
-	c.BypassCIDRs = bypassCIDRs
-	c.BypassExcludeCIDRs = bypassExcludeCIDRs
-
+	c.CompiledRules = compiled
 	return nil
 }
 

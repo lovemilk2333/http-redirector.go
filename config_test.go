@@ -4,7 +4,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -16,23 +15,22 @@ func TestConfigLoaderCreatesDefaultConfig(t *testing.T) {
 	if err := loader.Load(); err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if !slices.Equal(*loader.Config().BypassList, DEFAULT_BYPASS_LIST) {
-		t.Fatalf("BypassList = %v, want default %v", loader.Config().BypassList, DEFAULT_BYPASS_LIST)
+	if loader.Config().Rules == nil || len(*loader.Config().Rules) != len(DEFAULT_BYPASS_LIST) {
+		t.Fatalf("Rules = %#v, want converted default bypass rules", loader.Config().Rules)
 	}
-	if loader.Config().RedirectList == nil || len(*loader.Config().RedirectList) != 0 {
-		t.Fatalf("RedirectList = %#v, want default empty list", loader.Config().RedirectList)
-	}
-	if loader.Config().DenyList == nil || len(*loader.Config().DenyList) != 0 {
-		t.Fatalf("DenyList = %#v, want default empty list", loader.Config().DenyList)
+	for i, defaultRule := range DEFAULT_BYPASS_LIST {
+		if got, want := (*loader.Config().Rules)[i], defaultRule+";bypass"; got != want {
+			t.Errorf("default rule %d = %q, want %q", i, got, want)
+		}
 	}
 	if _, err := os.Stat(filename); err != nil {
 		t.Fatalf("default config was not saved: %v", err)
 	}
 }
 
-func TestConfigLoaderPreservesExplicitEmptyBypassList(t *testing.T) {
+func TestConfigLoaderPreservesExplicitEmptyRules(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(filename, []byte("bypass-list: []\n"), 0o600); err != nil {
+	if err := os.WriteFile(filename, []byte("rules: []\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	loader := &ConfigLoader{filename: filename}
@@ -40,8 +38,8 @@ func TestConfigLoaderPreservesExplicitEmptyBypassList(t *testing.T) {
 	if err := loader.Load(); err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if loader.Config().BypassList == nil || *loader.Config().BypassList == nil || len(*loader.Config().BypassList) != 0 {
-		t.Fatalf("BypassList = %#v, want explicit empty list", loader.Config().BypassList)
+	if loader.Config().Rules == nil || *loader.Config().Rules == nil || len(*loader.Config().Rules) != 0 {
+		t.Fatalf("Rules = %#v, want explicit empty list", loader.Config().Rules)
 	}
 	if err := loader.Save(); err != nil {
 		t.Fatalf("Save() error = %v", err)
@@ -51,23 +49,8 @@ func TestConfigLoaderPreservesExplicitEmptyBypassList(t *testing.T) {
 	if err := reloaded.Load(); err != nil {
 		t.Fatalf("reload error = %v", err)
 	}
-	if reloaded.Config().BypassList == nil || *reloaded.Config().BypassList == nil || len(*reloaded.Config().BypassList) != 0 {
-		t.Fatalf("reloaded BypassList = %#v, want explicit empty list", reloaded.Config().BypassList)
-	}
-}
-
-func TestConfigLoaderPreservesExplicitEmptyRedirectList(t *testing.T) {
-	filename := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(filename, []byte("redirect-list: []\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	loader := &ConfigLoader{filename: filename}
-
-	if err := loader.Load(); err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if loader.Config().RedirectList == nil || *loader.Config().RedirectList == nil || len(*loader.Config().RedirectList) != 0 {
-		t.Fatalf("RedirectList = %#v, want explicit empty list", loader.Config().RedirectList)
+	if reloaded.Config().Rules == nil || *reloaded.Config().Rules == nil || len(*reloaded.Config().Rules) != 0 {
+		t.Fatalf("reloaded Rules = %#v, want explicit empty list", reloaded.Config().Rules)
 	}
 }
 
@@ -99,7 +82,7 @@ func TestConfigLoaderPreservesDisabledPorts(t *testing.T) {
 
 func TestConfigLoaderUsesTwoSpaceIndentAndPreservesComments(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "config.yaml")
-	input := "# project settings\nhttp-port: 0 # disable HTTP\nbypass-list:\n  - 10.0.0.0/8 # private network\n"
+	input := "# project settings\nhttp-port: 0 # disable HTTP\nrules:\n  - 10.0.0.0/8;bypass # private network\n"
 	if err := os.WriteFile(filename, []byte(input), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +101,7 @@ func TestConfigLoaderUsesTwoSpaceIndentAndPreservesComments(t *testing.T) {
 	for _, want := range []string{
 		"# project settings",
 		"http-port: 0 # disable HTTP",
-		"  - 10.0.0.0/8 # private network",
+		"  - 10.0.0.0/8;bypass # private network",
 	} {
 		if !strings.Contains(string(data), want) {
 			t.Errorf("saved config does not contain %q:\n%s", want, data)
@@ -127,42 +110,38 @@ func TestConfigLoaderUsesTwoSpaceIndentAndPreservesComments(t *testing.T) {
 }
 
 func TestConfigBuildsReversedDomainRuleIndexes(t *testing.T) {
-	redirectList := []string{"xbox.*.microsoft.com", "+.baidu.com", ".lan"}
-	bypassList := []string{"192.168.0.0/16", "WWW.Example.COM"}
+	rules := []string{"xbox.*.microsoft.com;redirect", "+.baidu.com;redirect", ".lan;redirect", "192.168.0.0/16;bypass", "WWW.Example.COM;bypass"}
 	config := &Config{
-		RedirectList: &redirectList,
-		BypassList:   &bypassList,
+		Rules: &rules,
 	}
 	if err := config.ParseRules(); err != nil {
 		t.Fatalf("ParseRules() error = %v", err)
 	}
 
 	for _, domain := range []string{"xbox.a.microsoft.com", "xbox.b.microsoft.com", "baidu.com", "tieba.baidu.com", "123.tieba.baidu.com", "foo.lan", "a.b.lan"} {
-		if !config.RedirectRules.Matches(domain) {
+		if config.ResolveDomain(domain) != RuleRedirect {
 			t.Errorf("RedirectRules.Matches(%q) = false, want true", domain)
 		}
 	}
 	for _, domain := range []string{"xbox.microsoft.com", "a.xbox.b.microsoft.com", "lan"} {
-		if config.RedirectRules.Matches(domain) {
+		if config.ResolveDomain(domain) == RuleRedirect {
 			t.Errorf("RedirectRules.Matches(%q) = true, want false", domain)
 		}
 	}
-	if !config.BypassRules.Matches("www.example.com") || !config.BypassRules.Matches("WWW.EXAMPLE.COM.") {
+	if config.ResolveDomain("www.example.com") != RuleBypass || config.ResolveDomain("WWW.EXAMPLE.COM.") != RuleBypass {
 		t.Fatal("domain index should normalize labels to lowercase and ignore a trailing dot")
 	}
-	if len(config.RedirectCIDRs) != 0 || len(config.BypassCIDRs) != 1 || config.BypassCIDRs[0].String() != "192.168.0.0/16" {
-		t.Fatalf("CIDR indexes = redirect %v, bypass %v", config.RedirectCIDRs, config.BypassCIDRs)
+	if len(config.CompiledRules) != 5 || !config.CompiledRules[3].IsCIDR || config.CompiledRules[3].Prefix.String() != "192.168.0.0/16" {
+		t.Fatalf("compiled rules do not preserve input order and CIDR identity: %#v", config.CompiledRules)
 	}
-	if _, ok := config.RedirectRules["com"].Children["microsoft"].Children["*"]; !ok {
+	if _, ok := config.CompiledRules[0].Index["com"].Children["microsoft"].Children["*"]; !ok {
 		t.Fatal("domain rules are not stored as a reversed-label index")
 	}
 }
 
 func TestConfigMatchMethods(t *testing.T) {
-	redirectList := []string{"+.example.com", "10.0.0.0/8"}
-	denyList := []string{"+.blocked.example", "203.0.113.0/24"}
-	bypassList := []string{".internal", "192.168.0.0/16"}
-	config := &Config{RedirectList: &redirectList, DenyList: &denyList, BypassList: &bypassList}
+	rules := []string{"+.example.com;redirect", "10.0.0.0/8;redirect", "+.blocked.example;deny", "203.0.113.0/24;deny", ".internal;bypass", "192.168.0.0/16;bypass"}
+	config := &Config{Rules: &rules}
 	if err := config.ParseRules(); err != nil {
 		t.Fatalf("ParseRules() error = %v", err)
 	}
@@ -173,7 +152,7 @@ func TestConfigMatchMethods(t *testing.T) {
 	if !config.MatchBypassDomain("printer.internal") || config.MatchBypassDomain("internal") {
 		t.Fatal("MatchBypassDomain returned an unexpected result")
 	}
-	if !config.MatchDenyDomain("www.blocked.example") || config.MatchDenyDomain("example") {
+	if !config.MatchDenyDomain("www.blocked.example") || !config.MatchDenyDomain("example") {
 		t.Fatal("MatchDenyDomain returned an unexpected result")
 	}
 	if !config.MatchRedirectAddr(netip.MustParseAddr("10.2.3.4")) || config.MatchRedirectAddr(netip.MustParseAddr("192.168.1.2")) {
@@ -182,19 +161,22 @@ func TestConfigMatchMethods(t *testing.T) {
 	if !config.MatchBypassAddr(netip.MustParseAddr("192.168.1.2")) || config.MatchBypassAddr(netip.MustParseAddr("10.2.3.4")) {
 		t.Fatal("MatchBypassAddr returned an unexpected result")
 	}
-	if !config.MatchDenyAddr(netip.MustParseAddr("203.0.113.9")) || config.MatchDenyAddr(netip.MustParseAddr("203.0.114.9")) {
-		t.Fatal("MatchDenyAddr returned an unexpected result")
+	if !config.MatchDenyAddr(netip.MustParseAddr("203.0.113.9")) || !config.MatchDenyAddr(netip.MustParseAddr("203.0.114.9")) {
+		t.Fatal("MatchDenyAddr returned an unexpected result, unmatched addresses should be denied")
 	}
 }
 
-func TestEmptyRedirectListDoesNotMatchInvalidDomain(t *testing.T) {
+func TestDefaultRulesBypassListAndDoNotRedirect(t *testing.T) {
 	config := &Config{}
 	if err := config.ParseRules(); err != nil {
 		t.Fatalf("ParseRules() error = %v", err)
 	}
 
-	if !config.MatchRedirectDomain("example.com") {
-		t.Error("empty redirect list should match a valid domain")
+	if config.MatchRedirectDomain("example.com") || config.MatchBypassDomain("example.com") {
+		t.Error("unlisted domain should not match redirect or bypass rules")
+	}
+	if !config.MatchBypassDomain("printer.lan") || config.MatchRedirectDomain("printer.lan") {
+		t.Error("default bypass rules were not compiled as bypass-only rules")
 	}
 	for _, domain := range []string{"bad_name.example", strings.Repeat("a", MaxDomainLabelLength+1) + ".com", strings.Repeat("a.", 126) + "aa"} {
 		if config.MatchRedirectDomain(domain) {
@@ -204,8 +186,8 @@ func TestEmptyRedirectListDoesNotMatchInvalidDomain(t *testing.T) {
 }
 
 func TestRedirectRulesDoNotMatchOtherHostKindsByDefault(t *testing.T) {
-	redirectList := []string{"+.example.com"}
-	config := &Config{RedirectList: &redirectList}
+	rules := []string{"+.example.com;redirect"}
+	config := &Config{Rules: &rules}
 	if err := config.ParseRules(); err != nil {
 		t.Fatalf("ParseRules() error = %v", err)
 	}
@@ -213,8 +195,8 @@ func TestRedirectRulesDoNotMatchOtherHostKindsByDefault(t *testing.T) {
 		t.Error("domain-only redirect list matched an IP address")
 	}
 
-	redirectList = []string{"203.0.113.0/24"}
-	config = &Config{RedirectList: &redirectList}
+	rules = []string{"203.0.113.0/24;redirect"}
+	config = &Config{Rules: &rules}
 	if err := config.ParseRules(); err != nil {
 		t.Fatalf("ParseRules() error = %v", err)
 	}
@@ -288,32 +270,25 @@ func TestDomainRulePlusMatchesAnyDomain(t *testing.T) {
 }
 
 func TestConfigNegatedDomainAndCIDRRules(t *testing.T) {
-	redirectList := []string{"+.example.com", "!+.safe.example.com"}
-	denyList := []string{"10.0.0.0/8", "!10.1.0.0/16", "+.blocked.example", "!safe.blocked.example"}
-	config := &Config{RedirectList: &redirectList, DenyList: &denyList}
+	rules := []string{"!safe.example.com;deny", "safe.example.com;bypass", "+.example.com;redirect", "!10.0.0.0/8;deny", "10.0.0.0/8;bypass"}
+	config := &Config{Rules: &rules}
 	if err := config.ParseRules(); err != nil {
 		t.Fatalf("ParseRules() error = %v", err)
 	}
 
-	if !config.MatchRedirectDomain("www.example.com") || config.MatchRedirectDomain("safe.example.com") {
-		t.Error("redirect negation did not exclude the safe subdomain")
+	if config.ResolveDomain("safe.example.com") != RuleBypass || config.ResolveDomain("unsafe.example.com") != RuleDeny {
+		t.Error("negated rule or first-match ordering produced an unexpected domain action")
 	}
-	if !config.MatchDenyDomain("www.blocked.example") || config.MatchDenyDomain("safe.blocked.example") {
-		t.Error("deny negation did not exclude the safe domain")
-	}
-	if !config.MatchDenyAddr(netip.MustParseAddr("10.2.3.4")) || config.MatchDenyAddr(netip.MustParseAddr("10.1.3.4")) {
-		t.Error("CIDR negation did not exclude the nested prefix")
+	if !config.MatchDenyAddr(netip.MustParseAddr("192.0.2.1")) || config.ResolveAddr(netip.MustParseAddr("10.1.3.4")) != RuleBypass {
+		t.Error("CIDR negation did not match the complement before the positive CIDR")
 	}
 
-	negativeOnly := []string{"!10.0.0.0/8"}
-	config = &Config{RedirectList: &negativeOnly}
-	if err := config.ParseRules(); err != nil {
-		t.Fatalf("ParseRules() with exclusion-only rule error = %v", err)
+	orderedRules := []string{"+.blocked.example;bypass", "+.blocked.example;deny"}
+	orderedConfig := &Config{Rules: &orderedRules}
+	if err := orderedConfig.ParseRules(); err != nil {
+		t.Fatalf("ParseRules() with ordered rules error = %v", err)
 	}
-	if !config.MatchRedirectAddr(netip.MustParseAddr("192.0.2.1")) || config.MatchRedirectAddr(netip.MustParseAddr("10.0.0.1")) {
-		t.Error("exclusion-only CIDR list did not match the complement of its excluded prefix")
-	}
-	if config.MatchRedirectDomain("example.com") {
-		t.Error("CIDR rule should not match the domain matcher")
+	if orderedConfig.ResolveDomain("www.blocked.example") != RuleBypass {
+		t.Error("first matching rule did not take precedence")
 	}
 }

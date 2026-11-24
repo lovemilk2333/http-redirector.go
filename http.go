@@ -35,47 +35,19 @@ func newHandler(cl *ConfigLoader, isHTTP bool, transport http.RoundTripper) http
 
 		config := cl.Config()
 		host = strings.ToLower(strings.TrimSuffix(host, "."))
-		upgradeToHTTPS := shouldUpgradeToHTTPS(config, host)
-		denied := !upgradeToHTTPS && matchesDenyHost(config, host)
-		bypassed := matchesBypassHost(config, host)
-		if !upgradeToHTTPS && (denied || !bypassed) {
-			reason := "host did not match redirect or bypass rules"
-			if denied {
-				reason = "host matched deny rules"
-			}
-			slog.Debug("request denied", slog.String("reason", reason), slog.String("host", host), slog.String("from", r.RemoteAddr))
+		destination := config.ResolveHost(host)
+		if destination == RuleDeny {
+			slog.Debug("request denied", slog.String("reason", "host resolved to deny"), slog.String("host", host), slog.String("from", r.RemoteAddr), slog.String("destination", string(destination)))
 			http.Error(w, "request denied", http.StatusForbidden)
 			return
 		}
+		upgradeToHTTPS := destination == RuleRedirect
+		slog.Debug("request route selected", slog.String("host", host), slog.String("destination", string(destination)), slog.String("from", r.RemoteAddr))
 		if err := forwardHTTPWithTransport(w, r, upgradeToHTTPS, transport); err != nil {
 			slog.Debug("request forwarding failed", slog.String("host", host), slog.String("from", r.RemoteAddr), slog.Any("error", err))
 			http.Error(w, "upstream request failed", http.StatusBadGateway)
 		}
 	}
-}
-
-func shouldUpgradeToHTTPS(config *Config, host string) bool {
-	addr, err := netip.ParseAddr(host)
-	if err == nil {
-		return config.MatchRedirectAddr(addr)
-	}
-	return config.MatchRedirectDomain(host)
-}
-
-func matchesDenyHost(config *Config, host string) bool {
-	addr, err := netip.ParseAddr(host)
-	if err == nil {
-		return config.MatchDenyAddr(addr)
-	}
-	return config.MatchDenyDomain(host)
-}
-
-func matchesBypassHost(config *Config, host string) bool {
-	addr, err := netip.ParseAddr(host)
-	if err == nil {
-		return config.MatchBypassAddr(addr)
-	}
-	return config.MatchBypassDomain(host)
 }
 
 func forwardHTTPWithTransport(w http.ResponseWriter, r *http.Request, upgradeToHTTPS bool, transport http.RoundTripper) error {
@@ -155,7 +127,7 @@ func copyResponseHeaders(destination, source http.Header) {
 	}
 }
 
-func connectUpstreamTarget(host string, config *Config) (address, serverName string, tlsBridge, denied bool) {
+func connectUpstreamTarget(host string, config *Config) (address, serverName string, tlsBridge bool, destination RuleAction) {
 	requestHost, port, err := net.SplitHostPort(host)
 	if err != nil {
 		requestHost = strings.Trim(host, "[]")
@@ -165,13 +137,12 @@ func connectUpstreamTarget(host string, config *Config) (address, serverName str
 		port = "443"
 	}
 	requestHost = strings.ToLower(strings.TrimSuffix(requestHost, "."))
-	redirect := shouldUpgradeToHTTPS(config, requestHost)
-	denied = !redirect && (matchesDenyHost(config, requestHost) || !matchesBypassHost(config, requestHost))
-	tlsBridge = port == "80" && redirect
+	destination = config.ResolveHost(requestHost)
+	tlsBridge = port == "80" && destination == RuleRedirect
 	if tlsBridge {
 		port = "443"
 	}
-	return net.JoinHostPort(requestHost, port), requestHost, tlsBridge, denied
+	return net.JoinHostPort(requestHost, port), requestHost, tlsBridge, destination
 }
 
 func connectUpstreamAddress(host string, config *Config) string {
@@ -180,9 +151,10 @@ func connectUpstreamAddress(host string, config *Config) string {
 }
 
 func forwardConnect(w http.ResponseWriter, r *http.Request, config *Config) {
-	address, serverName, tlsBridge, denied := connectUpstreamTarget(r.Host, config)
-	if denied {
-		slog.Debug("CONNECT request denied", slog.String("reason", "host matched deny rules"), slog.String("host", r.Host), slog.String("from", r.RemoteAddr))
+	address, serverName, tlsBridge, destination := connectUpstreamTarget(r.Host, config)
+	slog.Debug("CONNECT route selected", slog.String("host", r.Host), slog.String("destination", string(destination)), slog.String("upstream", address), slog.String("from", r.RemoteAddr))
+	if destination == RuleDeny {
+		slog.Debug("CONNECT request denied", slog.String("reason", "host resolved to deny"), slog.String("host", r.Host), slog.String("from", r.RemoteAddr), slog.String("destination", string(destination)))
 		http.Error(w, "request denied", http.StatusForbidden)
 		return
 	}
