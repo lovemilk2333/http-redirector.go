@@ -24,6 +24,11 @@ build-arm64:
 	mkdir -p "$$out_dir"; \
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=arm64 go build $(GO_BUILD_FLAGS) -ldflags "$(BASE_LDFLAGS)" -o "$$out_dir/$(BINARY_NAME)" .
 
+build-android-arm64:
+	@out_dir="$(BIN_DIR)/android-arm64"; \
+	mkdir -p "$$out_dir"; \
+	CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build $(GO_BUILD_FLAGS) -ldflags "$(BASE_LDFLAGS)" -o "$$out_dir/$(BINARY_NAME)" .
+
 test:
 	go test ./...
 

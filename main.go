@@ -35,6 +35,9 @@ func main() {
 	if err := initLogger(c.LogLevel, c.LogSource, c.LogJSON); err != nil {
 		panic(err)
 	}
+	if maybeInstallAndroidDNSResolver() {
+		slog.Debug("Android DNS resolver enabled", "socket", androidDNSProxySocket)
+	}
 
 	slog.Info("inited")
 
